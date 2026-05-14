@@ -34,22 +34,56 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y zip curl jq python3-pip bc
+          sudo apt-get install -y zip curl jq bc git-lfs
           pip3 install huggingface-hub
+          # Install hf CLI
+          curl -fsSL https://hf.co/download/hf/linux/hf -o /usr/local/bin/hf
+          chmod +x /usr/local/bin/hf
       
       - name: Make scripts executable
         run: |
           mkdir -p scripts
           chmod +x scripts/*.sh 2>/dev/null || true
       
-      - name: Download repository using huggingface-hub
+      - name: Download repository using hf CLI
         id: download
         run: |
           bash scripts/download_hf_repo.sh "${{ github.event.inputs.repo_id }}"
       
+      - name: Check if download was successful
+        id: check
+        run: |
+          if [ ! -d "downloaded_repo" ] || [ -z "$(ls -A downloaded_repo)" ]; then
+            echo "❌ Download failed - no files found"
+            echo "Trying alternative method..."
+            
+            # Alternative: Use git clone with LFS
+            REPO_ID="${{ github.event.inputs.repo_id }}"
+            git clone https://huggingface.co/${REPO_ID} downloaded_repo
+            cd downloaded_repo
+            git lfs pull
+            cd ..
+            
+            # Remove .git directory
+            rm -rf downloaded_repo/.git
+          fi
+          
+          echo "Files in downloaded_repo:"
+          ls -la downloaded_repo/
+          echo ""
+          echo "File sizes:"
+          find downloaded_repo -type f -exec du -sh {} \; 2>/dev/null || echo "No files found"
+      
       - name: Get repository size and file info
         id: size
         run: |
+          if [ ! -d "downloaded_repo" ] || [ -z "$(ls -A downloaded_repo)" ]; then
+            echo "total_size=0" >> $GITHUB_OUTPUT
+            echo "total_size_mb=0" >> $GITHUB_OUTPUT
+            echo "file_count=0" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          
           TOTAL_SIZE=$(du -sb downloaded_repo | cut -f1)
           TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
           echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
@@ -61,6 +95,7 @@ jobs:
       
       - name: Create password-protected ZIP with parts
         id: create-zip
+        if: steps.size.outputs.file_count != '0'
         run: |
           REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
@@ -71,15 +106,21 @@ jobs:
           
           cd downloaded_repo
           zip -r -s ${{ github.event.inputs.part_size_mb }}m -P "${{ github.event.inputs.password }}" \
-            "../${ARCHIVE_NAME}.zip" .
+            "../${ARCHIVE_NAME}.zip" . || echo "Warning: ZIP creation had issues"
           cd ..
           
-          PART_COUNT=$(ls ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | wc -l)
-          echo "part_count=$PART_COUNT" >> $GITHUB_OUTPUT
-          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
-          echo "Total parts: $PART_COUNT"
+          if [ -f "${ARCHIVE_NAME}.zip" ]; then
+            PART_COUNT=$(ls ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | wc -l)
+            echo "part_count=$PART_COUNT" >> $GITHUB_OUTPUT
+            echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+            echo "Total parts: $PART_COUNT"
+          else
+            echo "No ZIP file created"
+            exit 1
+          fi
       
       - name: Generate README with instructions
+        if: steps.create-zip.outputs.archive_name != ''
         run: |
           bash scripts/create_readme.sh \
             "${{ steps.create-zip.outputs.archive_name }}" \
@@ -91,6 +132,7 @@ jobs:
             "${{ github.event.inputs.password }}"
       
       - name: Upload ZIP parts as artifacts
+        if: steps.create-zip.outputs.archive_name != ''
         uses: actions/upload-artifact@v4
         with:
           name: "${{ steps.create-zip.outputs.archive_name }}_parts"
@@ -102,7 +144,7 @@ jobs:
           retention-days: 90
       
       - name: Create GitHub Release (Optional)
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.create-zip.outputs.archive_name != ''
         run: |
           bash scripts/create_release_notes.sh \
             "${{ steps.create-zip.outputs.archive_name }}" \
@@ -116,12 +158,20 @@ jobs:
             --notes-file release_notes.md \
             ${{ steps.create-zip.outputs.archive_name }}.zip \
             ${{ steps.create-zip.outputs.archive_name }}.z* \
-            "README_${{ steps.create-zip.outputs.archive_name }}.md"
+            "README_${{ steps.create-zip.outputs.archive_name }}.md" 2>/dev/null || echo "Release may already exist"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Summary
+        if: always()
         run: |
+          if [ "${{ steps.size.outputs.file_count }}" == "0" ]; then
+            echo "## ❌ Download Failed!" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No files were downloaded. The repository might be private or inaccessible." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          
           echo "## ✅ Download Complete!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
