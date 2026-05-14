@@ -1,29 +1,29 @@
-name: Download HuggingFace Repo to ZIP Parts
+name: Download HuggingFace Repo (XetHub Compatible)
 
 on:
   workflow_dispatch:
     inputs:
-      repo_url:
-        description: 'HuggingFace Repository URL'
+      repo_id:
+        description: 'HuggingFace Repository ID (e.g., istupakov/parakeet-tdt-0.6b-v3-onnx)'
         required: true
-        default: 'https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx'
+        default: 'istupakov/parakeet-tdt-0.6b-v3-onnx'
         type: string
       password:
         description: 'ZIP Password'
         required: true
         default: 'your-password-here'
         type: string
-      branch:
-        description: 'Branch name (default: main)'
+      part_size_mb:
+        description: 'Part size in MB for splitting (default: 45)'
         required: false
-        default: 'main'
+        default: '45'
         type: string
 
 jobs:
   download-and-zip:
-    name: "Download HF Repo & Create Password-Protected ZIP Parts"
+    name: "Download HF Repo & Create ZIP Parts"
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 300
     permissions:
       contents: write
     
@@ -34,190 +34,216 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y git-lfs zip unzip curl bc
-          git lfs install
+          sudo apt-get install -y zip curl jq python3-pip
+          pip3 install huggingface-hub
       
-      - name: Parse HuggingFace repo URL
-        id: parse
+      - name: Download repository using huggingface-hub
         run: |
-          REPO_URL="${{ github.event.inputs.repo_url }}"
-          # Extract repo path from URL
-          REPO_PATH=$(echo "$REPO_URL" | sed -E 's|https?://huggingface.co/||' | sed 's|/tree/.*||' | sed 's|/blob/.*||')
-          echo "repo_path=$REPO_PATH" >> $GITHUB_OUTPUT
-          echo "Repository: $REPO_PATH"
+          REPO_ID="${{ github.event.inputs.repo_id }}"
+          echo "Downloading: $REPO_ID"
           
-          # Get repo name
-          REPO_NAME=$(basename "$REPO_PATH")
-          echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
+          # Create download directory
+          mkdir -p downloaded_repo
+          
+          # Use huggingface-cli to download all files (handles XetHub properly)
+          huggingface-cli download \
+            "$REPO_ID" \
+            --local-dir ./downloaded_repo \
+            --local-dir-use-symlinks False \
+            --resume-download \
+            --quiet
+          
+          echo "Download complete. Contents:"
+          ls -la downloaded_repo/
+          echo ""
+          echo "File sizes:"
+          du -sh downloaded_repo/* 2>/dev/null || echo "No files found"
       
-      - name: Clone HuggingFace repository
+      - name: Remove .git and .gitattributes
         run: |
-          REPO_PATH="${{ steps.parse.outputs.repo_path }}"
-          REPO_NAME="${{ steps.parse.outputs.repo_name }}"
+          # Remove any Git-related files and directories
+          rm -rf downloaded_repo/.git 2>/dev/null || true
+          rm -f downloaded_repo/.gitattributes 2>/dev/null || true
+          rm -f downloaded_repo/.gitignore 2>/dev/null || true
           
-          echo "Cloning https://huggingface.co/$REPO_PATH"
-          
-          # Clone with LFS
-          GIT_LFS_SKIP_SMUDGE=0 git clone https://huggingface.co/$REPO_PATH "$REPO_NAME"
-          
-          cd "$REPO_NAME"
-          
-          # Checkout specific branch if specified
-          BRANCH="${{ github.event.inputs.branch }}"
-          if [ "$BRANCH" != "main" ]; then
-            git checkout "$BRANCH" || echo "Branch $BRANCH not found, using default"
-          fi
-          
-          # Ensure all LFS files are downloaded
-          git lfs pull
-          
-          cd ..
-          
-          echo "Repository cloned successfully"
-          echo "Contents:"
-          ls -la "$REPO_NAME/"
+          echo "Cleaned directory:"
+          ls -la downloaded_repo/
       
       - name: Get repository size
         id: size
         run: |
-          REPO_NAME="${{ steps.parse.outputs.repo_name }}"
-          TOTAL_SIZE=$(du -sb "$REPO_NAME" | cut -f1)
+          TOTAL_SIZE=$(du -sb downloaded_repo | cut -f1)
           TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
           echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
           echo "total_size_mb=$TOTAL_SIZE_MB" >> $GITHUB_OUTPUT
           echo "Total size: ${TOTAL_SIZE_MB} MB"
-      
-      - name: Create password-protected ZIP with 45MB parts
-        run: |
-          REPO_NAME="${{ steps.parse.outputs.repo_name }}"
-          PASSWORD="${{ github.event.inputs.password }}"
-          PART_SIZE=45  # 45MB parts
           
-          ARCHIVE_NAME="${REPO_NAME}_$(date +%Y%m%d_%H%M%S)"
+          # Count files
+          FILE_COUNT=$(find downloaded_repo -type f | wc -l)
+          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          echo "Number of files: $FILE_COUNT"
+      
+      - name: Create password-protected ZIP with parts
+        run: |
+          REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
+          PASSWORD="${{ github.event.inputs.password }}"
+          PART_SIZE="${{ github.event.inputs.part_size_mb }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          ARCHIVE_NAME="${REPO_NAME}_${TIMESTAMP}"
           
           echo "Creating ZIP archive with ${PART_SIZE}MB parts"
           echo "Archive name: $ARCHIVE_NAME"
           echo "Password protection: ENABLED"
           
           # Create ZIP with splitting and password
+          cd downloaded_repo
           zip -r -s ${PART_SIZE}m -P "$PASSWORD" \
-            "${ARCHIVE_NAME}.zip" \
-            "$REPO_NAME/"
+            "../${ARCHIVE_NAME}.zip" \
+            .
+          cd ..
           
           # List created parts
           echo ""
           echo "Created ZIP parts:"
-          ls -lh ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null || ls -lh ${ARCHIVE_NAME}.zip
+          ls -lh ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | head -20
           
           # Count parts
           PART_COUNT=$(ls ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | wc -l)
-          echo ""
+          echo "part_count=$PART_COUNT" >> $GITHUB_OUTPUT
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
           echo "Total parts: $PART_COUNT"
       
-      - name: Generate download information
-        id: info
+      - name: Generate README with instructions
         run: |
-          REPO_NAME="${{ steps.parse.outputs.repo_name }}"
-          ARCHIVE_NAME="${REPO_NAME}_$(date +%Y%m%d_%H%M%S)"
+          ARCHIVE_NAME="${{ steps.create-zip.outputs.archive_name }}"
+          if [ -z "$ARCHIVE_NAME" ]; then
+            REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            ARCHIVE_NAME="${REPO_NAME}_${TIMESTAMP}"
+          fi
+          
           PASSWORD="${{ github.event.inputs.password }}"
+          PART_SIZE="${{ github.event.inputs.part_size_mb }}"
           TOTAL_SIZE_MB="${{ steps.size.outputs.total_size_mb }}"
+          FILE_COUNT="${{ steps.size.outputs.file_count }}"
+          PART_COUNT="${{ steps.create-zip.outputs.part_count }}"
           
-          PART_COUNT=$(ls ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | wc -l)
+          cat > "README_${ARCHIVE_NAME}.md" << 'EOF'
+    			# ${REPO_NAME} - HuggingFace Repository Archive
+    
+    			## Download Information
+    			- **Original Repository**: ${{ github.event.inputs.repo_id }}
+    			- **Archive Name**: `${ARCHIVE_NAME}.zip`
+    			- **Total Size**: ${TOTAL_SIZE_MB} MB
+    			- **Files**: ${FILE_COUNT} files
+    			- **Parts**: ${PART_COUNT} parts (${PART_SIZE}MB each)
+    			- **Password Protected**: **YES**
+    
+    			## Password
+    			```
+    			${PASSWORD}
+    			```
+    
+    			## How to Extract
+    
+    			### Windows (7-Zip/WinRAR):
+    			1. Download **all** parts (`.zip`, `.z01`, `.z02`, etc.)
+    			2. Put them in the **same folder**
+    			3. Right-click on `${ARCHIVE_NAME}.zip`
+    			4. Select "Extract Here" or "Extract to folder"
+    			5. Enter password: `${PASSWORD}`
+    
+    			### Linux/Mac:
+    			```bash
+    			# Download all parts to same directory, then:
+    			zip -P "${PASSWORD}" ${ARCHIVE_NAME}.zip -d extracted_files/
+    
+    			# Or using 7zip:
+    			7z x ${ARCHIVE_NAME}.zip -p"${PASSWORD}"
+    			```
+    
+    			### Python:
+    			```python
+    			import zipfile
+    			with zipfile.ZipFile('${ARCHIVE_NAME}.zip', 'r') as zip_ref:
+    				zip_ref.extractall('.', pwd=b'${PASSWORD}')
+    			```
+    
+    			## File List
+    			$(cd downloaded_repo && find . -type f | head -50 | sed 's/^/- /')
+    
+    			---
+    			*Archived on: $(date '+%Y-%m-%d %H:%M:%S UTC')*
+    			*Original source: https://huggingface.co/${{ github.event.inputs.repo_id }}*
+    			EOF
           
-          # Create README with instructions
-          cat > "README_${ARCHIVE_NAME}.md" << EOF
-          # ${REPO_NAME} - HuggingFace Repository Archive
+          # Substitute variables
+          sed -i "s/\${REPO_NAME}/$(basename "${{ github.event.inputs.repo_id }}")/g" "README_${ARCHIVE_NAME}.md"
+          sed -i "s/\${ARCHIVE_NAME}/${ARCHIVE_NAME}/g" "README_${ARCHIVE_NAME}.md"
+          sed -i "s/\${TOTAL_SIZE_MB}/${TOTAL_SIZE_MB}/g" "README_${ARCHIVE_NAME}.md"
+          sed -i "s/\${FILE_COUNT}/${FILE_COUNT}/g" "README_${ARCHIVE_NAME}.md"
+          sed -i "s/\${PART_COUNT}/${PART_COUNT}/g" "README_${ARCHIVE_NAME}.md"
+          sed -i "s/\${PART_SIZE}/${PART_SIZE}/g" "README_${ARCHIVE_NAME}.md"
+          sed -i "s/\${PASSWORD}/${PASSWORD}/g" "README_${ARCHIVE_NAME}.md"
           
-          ## Download Information
-          - **Original Repository**: ${{ github.event.inputs.repo_url }}
-          - **Branch**: ${{ github.event.inputs.branch }}
-          - **Archive Name**: \`${ARCHIVE_NAME}.zip\`
-          - **Total Size**: ${TOTAL_SIZE_MB} MB
-          - **Parts**: ${PART_COUNT} parts (${PART_SIZE}MB each)
-          - **Password Protected**: **YES**
-          
-          ## Password
-          \`\`\`
-          ${PASSWORD}
-          \`\`\`
-          
-          ## Download Links
-          
-          | # | File | Size |
-          |---|------|------|
-          EOF
-          
-          # List all parts with links
-          COUNTER=1
-          for PART in $(ls ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | sort -V); do
-            PART_SIZE=$(du -h "$PART" | cut -f1)
-            echo "| ${COUNTER} | \`${PART}\` | ${PART_SIZE} |" >> "README_${ARCHIVE_NAME}.md"
-            COUNTER=$((COUNTER + 1))
-          done
-          
-          cat >> "README_${ARCHIVE_NAME}.md" << EOF
-
-          ## How to Extract
-          
-          1. **Download all parts** (\`.zip\`, \`.z01\`, \`.z02\`, etc.)
-          2. **Place all parts in the same directory**
-          3. **Extract using one of these methods**:
-          
-             ### Linux/Mac:
-             \`\`\`bash
-             zip -P "${PASSWORD}" ${ARCHIVE_NAME}.zip -d ${ARCHIVE_NAME}
-             # Or use 7zip
-             7z x ${ARCHIVE_NAME}.zip
-             # Enter password when prompted
-             \`\`\`
-          
-             ### Windows:
-             - Use **7-Zip** or **WinRAR**
-             - Open \`${ARCHIVE_NAME}.zip\`
-             - Enter password: \`${PASSWORD}\`
-             - Extract normally
-          
-             ### Using Python:
-             \`\`\`python
-             import zipfile
-             with zipfile.ZipFile('${ARCHIVE_NAME}.zip', 'r') as zip_ref:
-                 zip_ref.extractall('.', pwd=b'${PASSWORD}')
-             \`\`\`
-          
-          ## Repository Contents
-          \`\`\`
-          $(tree -L 2 "$REPO_NAME" 2>/dev/null || ls -la "$REPO_NAME/")
-          \`\`\`
-          
-          ---
-          *Archived on: $(date '+%Y-%m-%d %H:%M:%S UTC')*
-          *Original source: ${{ github.event.inputs.repo_url }}*
-          EOF
-          
-          echo "archive_name=${ARCHIVE_NAME}" >> $GITHUB_OUTPUT
-          echo "part_count=${PART_COUNT}" >> $GITHUB_OUTPUT
+          echo "README_${ARCHIVE_NAME}.md created"
       
       - name: Upload ZIP parts as artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: "${{ steps.info.outputs.archive_name }}_parts"
+          name: "${{ steps.create-zip.outputs.archive_name }}_parts"
           path: |
-            ${{ steps.info.outputs.archive_name }}.zip
-            ${{ steps.info.outputs.archive_name }}.z*
-            README_${{ steps.info.outputs.archive_name }}.md
+            ${{ steps.create-zip.outputs.archive_name }}.zip
+            ${{ steps.create-zip.outputs.archive_name }}.z*
+            README_${{ steps.create-zip.outputs.archive_name }}.md
           compression-level: 0
           retention-days: 90
       
-      - name: Upload to GitHub Releases (Optional)
-        if: github.ref == 'refs/heads/main' || github.event.inputs.create_release == 'true'
+      - name: Create GitHub Release (Optional)
+        if: github.ref == 'refs/heads/main'
         run: |
-          ARCHIVE_NAME="${{ steps.info.outputs.archive_name }}"
-          PASSWORD="${{ github.event.inputs.password }}"
+          ARCHIVE_NAME="${{ steps.create-zip.outputs.archive_name }}"
+          if [ -z "$ARCHIVE_NAME" ]; then
+            REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            ARCHIVE_NAME="${REPO_NAME}_${TIMESTAMP}"
+          fi
           
-          # Create a release
-          gh release create "hf-${ARCHIVE_NAME}" \
-            --title "HuggingFace Repository: ${{ steps.parse.outputs.repo_name }}" \
-            --notes "Password: \`${PASSWORD}\`\n\nDownload all parts and extract with the password above." \
+          PASSWORD="${{ github.event.inputs.password }}"
+          TOTAL_SIZE_MB="${{ steps.size.outputs.total_size_mb }}"
+          PART_COUNT="${{ steps.create-zip.outputs.part_count }}"
+          
+          # Create release notes
+          cat > release_notes.md << EOF
+			## 📦 Repository Archive
+
+			- **Repository**: ${{ github.event.inputs.repo_id }}
+			- **Total Size**: ${TOTAL_SIZE_MB} MB
+			- **Parts**: ${PART_COUNT} parts (45MB each)
+			- **Password Protected**: YES
+
+			### 🔐 Password
+			\`\`\`
+			${PASSWORD}
+			\`\`\`
+
+			### 📥 Download
+			Download **all** ZIP parts from the Assets section below, then extract using the password above.
+
+			### 🔧 Extraction Instructions
+			1. Download all files: \`${ARCHIVE_NAME}.zip\`, \`${ARCHIVE_NAME}.z01\`, etc.
+			2. Place them in the same folder
+			3. Extract \`${ARCHIVE_NAME}.zip\` with any zip tool (7-Zip, WinRAR, etc.)
+			4. Enter the password when prompted
+
+			---
+			*Generated by GitHub Actions on $(date '+%Y-%m-%d %H:%M:%S UTC')*
+			EOF
+          
+          # Create release and upload assets
+          gh release create "v-${ARCHIVE_NAME}" \
+            --title "📦 ${REPO_NAME} - HF Repository Archive" \
+            --notes-file release_notes.md \
             ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* \
             "README_${ARCHIVE_NAME}.md"
         env:
@@ -225,19 +251,27 @@ jobs:
       
       - name: Summary
         run: |
-          ARCHIVE_NAME="${{ steps.info.outputs.archive_name }}"
-          PART_COUNT="${{ steps.info.outputs.part_count }}"
+          ARCHIVE_NAME="${{ steps.create-zip.outputs.archive_name }}"
+          if [ -z "$ARCHIVE_NAME" ]; then
+            REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
+            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+            ARCHIVE_NAME="${REPO_NAME}_${TIMESTAMP}"
+          fi
+          
+          PART_COUNT="${{ steps.create-zip.outputs.part_count }}"
           TOTAL_SIZE_MB="${{ steps.size.outputs.total_size_mb }}"
+          FILE_COUNT="${{ steps.size.outputs.file_count }}"
           
           echo "## ✅ Download Complete!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Repository** | ${{ steps.parse.outputs.repo_path }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Repository** | ${{ github.event.inputs.repo_id }} |" >> $GITHUB_STEP_SUMMARY
           echo "| **Archive** | \`${ARCHIVE_NAME}.zip\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Total Size** | ${TOTAL_SIZE_MB} MB |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Parts** | ${PART_COUNT} parts (45MB each) |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Files** | ${FILE_COUNT} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Parts** | ${PART_COUNT} parts |" >> $GITHUB_STEP_SUMMARY
           echo "| **Password** | \`${{ github.event.inputs.password }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📥 Download Artifacts" >> $GITHUB_STEP_SUMMARY
+          echo "### 📥 Download Location" >> $GITHUB_STEP_SUMMARY
           echo "The ZIP parts are available in the **Artifacts** section of this workflow run." >> $GITHUB_STEP_SUMMARY
