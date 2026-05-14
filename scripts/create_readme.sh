@@ -39,10 +39,10 @@ ${PASSWORD}
 ### Linux/Mac:
 \`\`\`bash
 # Download all parts to same directory, then:
-zip -P "${PASSWORD}" ${ARCHIVE_NAME}.zip -d extracted_files/
+unzip ${ARCHIVE_NAME}.zip
 
-# Or using 7zip:
-7z x ${ARCHIVE_NAME}.zip -p"${PASSWORD}"
+# Or extract with password:
+unzip -P "${PASSWORD}" ${ARCHIVE_NAME}.zip
 \`\`\`
 
 ### Python:
@@ -55,8 +55,10 @@ with zipfile.ZipFile('${ARCHIVE_NAME}.zip', 'r') as zip_ref:
 ## File List
 EOF
 
-# Add file list
-cd downloaded_repo && find . -type f | head -50 | sed 's/^/- /' >> "../$README_FILE" && cd ..
+# Add file list if directory exists
+if [ -d "downloaded_repo" ]; then
+  cd downloaded_repo && find . -type f | head -50 | sed 's/^/- /' >> "../$README_FILE" && cd ..
+fi
 
 # Add footer
 cat >> "$README_FILE" << EOF
