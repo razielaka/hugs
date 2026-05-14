@@ -1,0 +1,4 @@
+Repository: istupakov/parakeet-tdt-0.6b-v3-onnx
+Date: 2026-05-14 10:55:38 UTC
+Parts: 62
+Password required for extraction
