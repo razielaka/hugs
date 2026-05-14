@@ -1,27 +1,25 @@
-name: Download HuggingFace Repo (XetHub Compatible)
+name: Download HuggingFace Repo
 
 on:
   workflow_dispatch:
     inputs:
       repo_id:
-        description: 'HuggingFace Repository ID (e.g., istupakov/parakeet-tdt-0.6b-v3-onnx)'
+        description: 'HuggingFace Repository ID'
         required: true
         default: 'istupakov/parakeet-tdt-0.6b-v3-onnx'
         type: string
       password:
         description: 'ZIP Password'
         required: true
-        default: 'your-password-here'
         type: string
       part_size_mb:
-        description: 'Part size in MB for splitting (default: 45)'
+        description: 'Part size in MB'
         required: false
         default: '45'
         type: string
 
 jobs:
   download-and-zip:
-    name: "Download HF Repo & Create ZIP Parts"
     runs-on: ubuntu-latest
     timeout-minutes: 300
     permissions:
@@ -34,154 +32,147 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y zip curl jq bc git-lfs
+          sudo apt-get install -y zip git-lfs bc
           pip3 install huggingface-hub
-          # Install hf CLI
-          curl -fsSL https://hf.co/download/hf/linux/hf -o /usr/local/bin/hf
-          chmod +x /usr/local/bin/hf
       
-      - name: Make scripts executable
+      - name: Download with Python script
         run: |
-          mkdir -p scripts
-          chmod +x scripts/*.sh 2>/dev/null || true
-      
-      - name: Download repository using hf CLI
-        id: download
-        run: |
-          bash scripts/download_hf_repo.sh "${{ github.event.inputs.repo_id }}"
-      
-      - name: Check if download was successful
-        id: check
-        run: |
-          if [ ! -d "downloaded_repo" ] || [ -z "$(ls -A downloaded_repo)" ]; then
-            echo "❌ Download failed - no files found"
-            echo "Trying alternative method..."
-            
-            # Alternative: Use git clone with LFS
-            REPO_ID="${{ github.event.inputs.repo_id }}"
-            git clone https://huggingface.co/${REPO_ID} downloaded_repo
-            cd downloaded_repo
-            git lfs pull
-            cd ..
-            
-            # Remove .git directory
-            rm -rf downloaded_repo/.git
-          fi
+          cat > download_hf.py << 'PYTHON_SCRIPT'
+          import os
+          import sys
+          from huggingface_hub import snapshot_download
           
-          echo "Files in downloaded_repo:"
-          ls -la downloaded_repo/
-          echo ""
-          echo "File sizes:"
-          find downloaded_repo -type f -exec du -sh {} \; 2>/dev/null || echo "No files found"
-      
-      - name: Get repository size and file info
-        id: size
-        run: |
-          if [ ! -d "downloaded_repo" ] || [ -z "$(ls -A downloaded_repo)" ]; then
-            echo "total_size=0" >> $GITHUB_OUTPUT
-            echo "total_size_mb=0" >> $GITHUB_OUTPUT
-            echo "file_count=0" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+          repo_id = sys.argv[1]
+          print(f"Downloading: {repo_id}")
           
+          try:
+              snapshot_download(
+                  repo_id=repo_id,
+                  local_dir="./downloaded_repo",
+                  local_dir_use_symlinks=False,
+                  resume_download=True,
+                  ignore_patterns=[".git", ".gitattributes", ".gitignore", ".hf"]
+              )
+              print("Download successful")
+          except Exception as e:
+              print(f"Error: {e}")
+              sys.exit(1)
+          PYTHON_SCRIPT
+          
+          python3 download_hf.py "${{ github.event.inputs.repo_id }}"
+      
+      - name: Clean up git files
+        run: |
+          rm -rf downloaded_repo/.git 2>/dev/null || true
+          rm -f downloaded_repo/.gitattributes 2>/dev/null || true
+          rm -f downloaded_repo/.gitignore 2>/dev/null || true
+          rm -rf downloaded_repo/.hf 2>/dev/null || true
+          echo "Files downloaded:"
+          find downloaded_repo -type f | head -20
+      
+      - name: Get repository info
+        id: info
+        run: |
+          FILE_COUNT=$(find downloaded_repo -type f | wc -l)
           TOTAL_SIZE=$(du -sb downloaded_repo | cut -f1)
           TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
-          echo "total_size=$TOTAL_SIZE" >> $GITHUB_OUTPUT
-          echo "total_size_mb=$TOTAL_SIZE_MB" >> $GITHUB_OUTPUT
           
-          FILE_COUNT=$(find downloaded_repo -type f | wc -l)
           echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
+          echo "total_size_mb=$TOTAL_SIZE_MB" >> $GITHUB_OUTPUT
           echo "Total size: ${TOTAL_SIZE_MB} MB, Files: $FILE_COUNT"
       
-      - name: Create password-protected ZIP with parts
-        id: create-zip
-        if: steps.size.outputs.file_count != '0'
+      - name: Create ZIP archive
+        id: zip
         run: |
           REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
           ARCHIVE_NAME="${REPO_NAME}_${TIMESTAMP}"
           
-          echo "Creating ZIP archive with ${{ github.event.inputs.part_size_mb }}MB parts"
-          echo "Archive name: $ARCHIVE_NAME"
-          
           cd downloaded_repo
-          zip -r -s ${{ github.event.inputs.part_size_mb }}m -P "${{ github.event.inputs.password }}" \
-            "../${ARCHIVE_NAME}.zip" . || echo "Warning: ZIP creation had issues"
+          zip -r -s ${{ github.event.inputs.part_size_mb }}m \
+            -P "${{ github.event.inputs.password }}" \
+            "../${ARCHIVE_NAME}.zip" .
           cd ..
           
-          if [ -f "${ARCHIVE_NAME}.zip" ]; then
-            PART_COUNT=$(ls ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | wc -l)
-            echo "part_count=$PART_COUNT" >> $GITHUB_OUTPUT
-            echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
-            echo "Total parts: $PART_COUNT"
-          else
-            echo "No ZIP file created"
-            exit 1
-          fi
+          PART_COUNT=$(ls ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | wc -l)
+          echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
+          echo "part_count=$PART_COUNT" >> $GITHUB_OUTPUT
       
-      - name: Generate README with instructions
-        if: steps.create-zip.outputs.archive_name != ''
+      - name: Create README
         run: |
-          bash scripts/create_readme.sh \
-            "${{ steps.create-zip.outputs.archive_name }}" \
-            "${{ github.event.inputs.repo_id }}" \
-            "${{ steps.size.outputs.total_size_mb }}" \
-            "${{ steps.size.outputs.file_count }}" \
-            "${{ steps.create-zip.outputs.part_count }}" \
-            "${{ github.event.inputs.part_size_mb }}" \
-            "${{ github.event.inputs.password }}"
+          ARCHIVE_NAME="${{ steps.zip.outputs.archive_name }}"
+          REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
+          
+          echo "# ${REPO_NAME} - HuggingFace Repository Archive" > README_${ARCHIVE_NAME}.md
+          echo "" >> README_${ARCHIVE_NAME}.md
+          echo "## Download Information" >> README_${ARCHIVE_NAME}.md
+          echo "- Original Repository: ${{ github.event.inputs.repo_id }}" >> README_${ARCHIVE_NAME}.md
+          echo "- Archive Name: \`${ARCHIVE_NAME}.zip\`" >> README_${ARCHIVE_NAME}.md
+          echo "- Total Size: ${{ steps.info.outputs.total_size_mb }} MB" >> README_${ARCHIVE_NAME}.md
+          echo "- Files: ${{ steps.info.outputs.file_count }}" >> README_${ARCHIVE_NAME}.md
+          echo "- Parts: ${{ steps.zip.outputs.part_count }} parts (${{ github.event.inputs.part_size_mb }}MB each)" >> README_${ARCHIVE_NAME}.md
+          echo "- Password Protected: YES" >> README_${ARCHIVE_NAME}.md
+          echo "" >> README_${ARCHIVE_NAME}.md
+          echo "## Password" >> README_${ARCHIVE_NAME}.md
+          echo "\`\`\`" >> README_${ARCHIVE_NAME}.md
+          echo "${{ github.event.inputs.password }}" >> README_${ARCHIVE_NAME}.md
+          echo "\`\`\`" >> README_${ARCHIVE_NAME}.md
+          echo "" >> README_${ARCHIVE_NAME}.md
+          echo "## How to Extract" >> README_${ARCHIVE_NAME}.md
+          echo "" >> README_${ARCHIVE_NAME}.md
+          echo "1. Download all parts (.zip, .z01, .z02, etc.)" >> README_${ARCHIVE_NAME}.md
+          echo "2. Place them in the same folder" >> README_${ARCHIVE_NAME}.md
+          echo "3. Extract with password using 7-Zip or WinRAR" >> README_${ARCHIVE_NAME}.md
+          echo "" >> README_${ARCHIVE_NAME}.md
+          echo "### Linux/Mac Command Line:" >> README_${ARCHIVE_NAME}.md
+          echo "\`\`\`bash" >> README_${ARCHIVE_NAME}.md
+          echo "unzip -P \"${{ github.event.inputs.password }}\" ${ARCHIVE_NAME}.zip" >> README_${ARCHIVE_NAME}.md
+          echo "\`\`\`" >> README_${ARCHIVE_NAME}.md
+          echo "" >> README_${ARCHIVE_NAME}.md
+          echo "---" >> README_${ARCHIVE_NAME}.md
+          echo "*Archived on: $(date '+%Y-%m-%d %H:%M:%S UTC')*" >> README_${ARCHIVE_NAME}.md
       
-      - name: Upload ZIP parts as artifacts
-        if: steps.create-zip.outputs.archive_name != ''
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: "${{ steps.create-zip.outputs.archive_name }}_parts"
+          name: "${{ steps.zip.outputs.archive_name }}_parts"
           path: |
-            ${{ steps.create-zip.outputs.archive_name }}.zip
-            ${{ steps.create-zip.outputs.archive_name }}.z*
-            README_${{ steps.create-zip.outputs.archive_name }}.md
+            ${{ steps.zip.outputs.archive_name }}.zip
+            ${{ steps.zip.outputs.archive_name }}.z*
+            README_${{ steps.zip.outputs.archive_name }}.md
           compression-level: 0
           retention-days: 90
       
-      - name: Create GitHub Release (Optional)
-        if: github.ref == 'refs/heads/main' && steps.create-zip.outputs.archive_name != ''
+      - name: Create GitHub Release
+        if: github.ref == 'refs/heads/main'
         run: |
-          bash scripts/create_release_notes.sh \
-            "${{ steps.create-zip.outputs.archive_name }}" \
-            "${{ github.event.inputs.repo_id }}" \
-            "${{ steps.size.outputs.total_size_mb }}" \
-            "${{ steps.create-zip.outputs.part_count }}" \
-            "${{ github.event.inputs.password }}"
+          ARCHIVE_NAME="${{ steps.zip.outputs.archive_name }}"
+          REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
           
-          gh release create "v-${{ steps.create-zip.outputs.archive_name }}" \
-            --title "📦 $(basename "${{ github.event.inputs.repo_id }}") - HF Repository Archive" \
+          echo "# ${{ github.event.inputs.repo_id }}" > release_notes.md
+          echo "" >> release_notes.md
+          echo "## Download Information" >> release_notes.md
+          echo "- Total Size: ${{ steps.info.outputs.total_size_mb }} MB" >> release_notes.md
+          echo "- Parts: ${{ steps.zip.outputs.part_count }} parts" >> release_notes.md
+          echo "- Password: \`${{ github.event.inputs.password }}\`" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "## Instructions" >> release_notes.md
+          echo "1. Download all ZIP parts from assets below" >> release_notes.md
+          echo "2. Extract with password using any zip tool" >> release_notes.md
+          
+          gh release create "v-${ARCHIVE_NAME}" \
+            --title "📦 ${REPO_NAME}" \
             --notes-file release_notes.md \
-            ${{ steps.create-zip.outputs.archive_name }}.zip \
-            ${{ steps.create-zip.outputs.archive_name }}.z* \
-            "README_${{ steps.create-zip.outputs.archive_name }}.md" 2>/dev/null || echo "Release may already exist"
+            ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* \
+            "README_${ARCHIVE_NAME}.md" || true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
       - name: Summary
-        if: always()
         run: |
-          if [ "${{ steps.size.outputs.file_count }}" == "0" ]; then
-            echo "## ❌ Download Failed!" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "No files were downloaded. The repository might be private or inaccessible." >> $GITHUB_STEP_SUMMARY
-            exit 1
-          fi
-          
-          echo "## ✅ Download Complete!" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Repository** | ${{ github.event.inputs.repo_id }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Archive** | \`${{ steps.create-zip.outputs.archive_name }}.zip\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Total Size** | ${{ steps.size.outputs.total_size_mb }} MB |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Files** | ${{ steps.size.outputs.file_count }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Parts** | ${{ steps.create-zip.outputs.part_count }} parts |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Password** | \`${{ github.event.inputs.password }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 📥 Download Location" >> $GITHUB_STEP_SUMMARY
-          echo "The ZIP parts are available in the **Artifacts** section of this workflow run." >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Download Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- Repository: ${{ github.event.inputs.repo_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Size: ${{ steps.info.outputs.total_size_mb }} MB" >> $GITHUB_STEP_SUMMARY
+          echo "- Files: ${{ steps.info.outputs.file_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Parts: ${{ steps.zip.outputs.part_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Password: \`${{ github.event.inputs.password }}\`" >> $GITHUB_STEP_SUMMARY
