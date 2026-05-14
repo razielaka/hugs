@@ -61,18 +61,90 @@ jobs:
           ollama pull ${{ github.event.inputs.model_name }}
           echo "Model pull completed"
       
+      - name: Debug - Find Ollama installation
+        run: |
+          echo "=== Finding Ollama installation ==="
+          which ollama
+          ollama --version
+          
+          echo "=== Ollama environment ==="
+          env | grep -i ollama || echo "No OLLAMA env vars"
+          
+          echo "=== Home directory contents ==="
+          ls -la ~/
+          
+          echo "=== Looking for .ollama directory ==="
+          find ~ -name ".ollama" -type d 2>/dev/null || echo "No .ollama found in home"
+          
+          echo "=== Looking for ollama directories ==="
+          sudo find / -name "ollama" -type d 2>/dev/null | head -20
+          
+          echo "=== Check running processes ==="
+          ps aux | grep ollama
+      
+      - name: Debug - Find models after pull
+        run: |
+          echo "=== Ollama model list ==="
+          ollama list
+          
+          echo "=== Checking common Ollama paths ==="
+          PATHS_TO_CHECK=(
+            "$HOME/.ollama"
+            "/root/.ollama"
+            "/usr/share/ollama/.ollama"
+            "/var/lib/ollama"
+            "/tmp/ollama"
+          )
+          
+          for path in "${PATHS_TO_CHECK[@]}"; do
+            if [ -d "$path" ]; then
+              echo "Found: $path"
+              ls -la "$path"
+              if [ -d "$path/models" ]; then
+                echo "  - models directory exists"
+                ls -la "$path/models"
+              fi
+            fi
+          done
+          
+          echo "=== Full system search for blobs ==="
+          sudo find / -name "blobs" -type d 2>/dev/null | grep -v "^/proc" | grep -v "^/sys" | head -10
+      
       - name: Locate and prepare model files
         id: prepare
         run: |
-          # Find Ollama models directory
-          OLLAMA_HOME="${HOME}/.ollama"
-          if [ ! -d "$OLLAMA_HOME" ]; then
-            OLLAMA_HOME="/usr/share/ollama/.ollama"
+          set -x  # Enable debug output
+          
+          # Try multiple possible Ollama paths
+          OLLAMA_HOME=""
+          POSSIBLE_PATHS=(
+            "$HOME/.ollama"
+            "/root/.ollama"
+            "/usr/share/ollama/.ollama"
+            "/var/lib/ollama"
+          )
+          
+          for path in "${POSSIBLE_PATHS[@]}"; do
+            if [ -d "$path" ] && [ -d "$path/models" ]; then
+              OLLAMA_HOME="$path"
+              echo "Found Ollama at: $OLLAMA_HOME"
+              break
+            fi
+          done
+          
+          if [ -z "$OLLAMA_HOME" ]; then
+            echo "ERROR: Could not find Ollama models directory"
+            echo "Tried paths: ${POSSIBLE_PATHS[@]}"
+            echo "Current user: $(whoami)"
+            echo "Home: $HOME"
+            echo "Full find for .ollama:"
+            find /home -name ".ollama" -type d 2>/dev/null
+            exit 1
           fi
           
-          echo "Ollama home: $OLLAMA_HOME"
+          echo "ollama_home=$OLLAMA_HOME" >> $GITHUB_OUTPUT
           
-          # Create safe model name for filename (replace / and : with _)
+          # Create safe model name
           SAFE_NAME=$(echo "${{ github.event.inputs.model_name }}" | sed 's/[\/:]/_/g')
           echo "safe_name=$SAFE_NAME" >> $GITHUB_OUTPUT
           
@@ -83,145 +155,139 @@ jobs:
           # Create model_data directory
           mkdir -p model_data
           
-          # Copy the entire models directory structure
-          if [ -d "$OLLAMA_HOME/models" ]; then
-            cp -r "$OLLAMA_HOME/models" model_data/
-            echo "Copied models directory"
-          else
-            echo "ERROR: models directory not found at $OLLAMA_HOME/models"
-            ls -la $OLLAMA_HOME/
-            exit 1
-          fi
+          # Copy models directory
+          echo "Copying from $OLLAMA_HOME/models to model_data/models"
+          cp -r "$OLLAMA_HOME/models" model_data/
           
-          # Also copy blobs if they exist separately
+          # Also check for blobs directory at root level
           if [ -d "$OLLAMA_HOME/blobs" ]; then
+            echo "Copying blobs from $OLLAMA_HOME/blobs"
             cp -r "$OLLAMA_HOME/blobs" model_data/
-            echo "Copied blobs directory"
           fi
           
           # Show what we have
-          echo "Contents of model_data:"
+          echo "=== model_data contents ==="
           ls -la model_data/
           
+          echo "=== model_data/models contents ==="
           if [ -d "model_data/models" ]; then
-            echo "Models directory contents:"
             ls -la model_data/models/
             
-            # Show manifests
+            echo "=== manifests ==="
             if [ -d "model_data/models/manifests" ]; then
-              echo "Manifests:"
-              find model_data/models/manifests -type f
+              find model_data/models/manifests -type f -exec ls -lh {} \;
+            else
+              echo "No manifests directory found"
             fi
             
-            # Show blobs
+            echo "=== blobs ==="
             if [ -d "model_data/models/blobs" ]; then
               BLOB_COUNT=$(find model_data/models/blobs -type f | wc -l)
               echo "Found $BLOB_COUNT blob files"
+              if [ $BLOB_COUNT -gt 0 ]; then
+                ls -lh model_data/models/blobs/ | head -20
+              fi
+            else
+              echo "No blobs directory found under models"
             fi
+          else
+            echo "model_data/models does not exist!"
           fi
           
-          # Verify we have files to zip
-          if [ $(find model_data -type f | wc -l) -eq 0 ]; then
+          # Verify we have files
+          FILE_COUNT=$(find model_data -type f 2>/dev/null | wc -l)
+          echo "Total files to archive: $FILE_COUNT"
+          
+          if [ $FILE_COUNT -eq 0 ]; then
             echo "ERROR: No files found in model_data"
+            echo "Trying to find actual blob locations..."
+            
+            # Try to find where Ollama actually stores blobs
+            echo "Checking process for Ollama storage location:"
+            ps aux | grep ollama
+            
+            # Try to get info from ollama show command
+            echo "Model info from ollama:"
+            ollama show ${{ github.event.inputs.model_name }} 2>&1 || echo "Cannot show model info"
+            
             exit 1
           fi
+          
+          set +x  # Disable debug output
       
       - name: Create ZIP archive with password
+        if: steps.prepare.outcome == 'success'
         run: |
           ARCHIVE_NAME="${{ steps.prepare.outputs.archive_name }}"
           
           echo "Creating zip archive from model_data directory..."
           cd model_data
           
-          # Check if there are files to zip
-          if [ $(find . -type f | wc -l) -eq 0 ]; then
-            echo "ERROR: No files to zip"
-            exit 1
-          fi
+          # Show current directory contents
+          echo "Current directory: $(pwd)"
+          echo "Files to zip:"
+          find . -type f | head -20
           
-          # Create the zip archive with all files
+          # Create the zip archive
           zip -r -s ${{ github.event.inputs.part_size_mb }}m \
             -P "${{ github.event.inputs.password }}" \
             "../${ARCHIVE_NAME}.zip" .
           
-          if [ $? -eq 0 ]; then
-            echo "ZIP created successfully"
-          else
-            echo "ZIP creation failed"
-            exit 1
-          fi
-          
+          ZIP_EXIT=$?
           cd ..
           
-          # List created files
-          echo "Created archive parts:"
-          ls -lh ${ARCHIVE_NAME}.zip* 2>/dev/null || echo "No archive parts found"
+          if [ $ZIP_EXIT -eq 0 ]; then
+            echo "ZIP created successfully"
+            echo "Created files:"
+            ls -lh ${ARCHIVE_NAME}.zip* 2>/dev/null
+          else
+            echo "ZIP creation failed with exit code: $ZIP_EXIT"
+            exit 1
+          fi
       
       - name: Create downloads directory
+        if: steps.prepare.outcome == 'success'
         run: |
           ARCHIVE_NAME="${{ steps.prepare.outputs.archive_name }}"
           mkdir -p downloads/${ARCHIVE_NAME}
       
-      - name: Move and push ZIP parts incrementally
+      - name: Move and push ZIP parts
+        if: steps.prepare.outcome == 'success'
         run: |
           ARCHIVE_NAME="${{ steps.prepare.outputs.archive_name }}"
           
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          # Count files to push
           FILE_COUNT=$(ls ${ARCHIVE_NAME}.zip* 2>/dev/null | wc -l)
           echo "Found $FILE_COUNT parts to push"
           
           if [ $FILE_COUNT -eq 0 ]; then
-            echo "ERROR: No archive parts found to push"
+            echo "ERROR: No archive parts found"
             exit 1
           fi
           
-          # Push each part individually to avoid timeout
           COUNTER=0
           for file in ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z*; do
             if [ -f "$file" ]; then
               COUNTER=$((COUNTER + 1))
-              echo "Moving and pushing part $COUNTER: $file"
+              echo "Moving and pushing part $COUNTER/$FILE_COUNT: $file"
               mv "$file" downloads/${ARCHIVE_NAME}/
               git add downloads/${ARCHIVE_NAME}/$(basename "$file")
-              git commit -m "Add part $COUNTER/$(ls ${ARCHIVE_NAME}.zip* 2>/dev/null | wc -l) for ${ARCHIVE_NAME}"
+              git commit -m "Add part $COUNTER/$FILE_COUNT for ${ARCHIVE_NAME}"
               git push
               sleep 2
             fi
           done
       
-      - name: Get model information
-        id: model_info
-        run: |
-          # Get model details
-          MODEL_NAME="${{ github.event.inputs.model_name }}"
-          
-          # Try to get modelfile
-          MODELFILE=$(ollama show $MODEL_NAME --modelfile 2>/dev/null || echo "Not available")
-          
-          # Get model size from actual files
-          if [ -d "model_data" ]; then
-            MODEL_SIZE=$(du -sh model_data 2>/dev/null | cut -f1 || echo "Unknown")
-          else
-            MODEL_SIZE="Unknown"
-          fi
-          
-          echo "model_size=$MODEL_SIZE" >> $GITHUB_OUTPUT
-          
-          # Save modelfile for later
-          echo "$MODELFILE" > modelfile.txt
-      
-      - name: Create documentation and finalize
+      - name: Create documentation
+        if: steps.prepare.outcome == 'success'
         run: |
           ARCHIVE_NAME="${{ steps.prepare.outputs.archive_name }}"
-          SAFE_NAME="${{ steps.prepare.outputs.safe_name }}"
           
-          # Count parts
           PART_COUNT=$(ls downloads/${ARCHIVE_NAME}/*.zip downloads/${ARCHIVE_NAME}/*.z* 2>/dev/null | wc -l)
           
-          cat > downloads/${ARCHIVE_NAME}/INFO.txt << 'EOF'
+          cat > downloads/${ARCHIVE_NAME}/INFO.txt << EOF
           Ollama Model Archive
           ====================
           
@@ -230,95 +296,45 @@ jobs:
           Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
           Archive Name: ${{ steps.prepare.outputs.archive_name }}
           Total Parts: $PART_COUNT
-          Model Size: ${{ steps.model_info.outputs.model_size }}
-          
-          This archive is password protected.
-          
-          Model File Contents:
-          ${{ steps.model_info.outputs.modelfile }}
           
           Restoration Instructions:
           =========================
           
           1. Download all parts to a directory
-          2. Combine parts if needed:
-             cat ${ARCHIVE_NAME}.zip* > combined.zip
+          2. Extract with password:
+             unzip -P "${{ github.event.inputs.password }}" ${ARCHIVE_NAME}.zip -d ~/.ollama/
              
-          3. Extract with password:
-             unzip -P "PASSWORD_HERE" combined.zip -d ~/.ollama/
-             
-             Or extract each part:
-             unzip -P "PASSWORD_HERE" ${ARCHIVE_NAME}.zip -d ~/.ollama/
-             
-          4. Verify the model:
+          3. Verify the model:
              ollama list
              
-          5. Run the model:
+          4. Run the model:
              ollama run ${{ github.event.inputs.model_name }}
-          
-          Note: Replace PASSWORD_HERE with the password used when creating this archive.
           EOF
           
-          # Update README
           if [ ! -f README.md ]; then
             echo "# Ollama Models Repository" > README.md
             echo "" >> README.md
-            echo "This repository contains password-protected archives of Ollama models." >> README.md
-            echo "" >> README.md
-            echo "## Available Models" >> README.md
-            echo "" >> README.md
           fi
           
-          # Check if model already exists in README
-          if ! grep -q "${{ github.event.inputs.model_name }}" README.md; then
-            echo "### ${{ github.event.inputs.model_name }}" >> README.md
-            echo "- **Archive**: [downloads/${ARCHIVE_NAME}/](downloads/${ARCHIVE_NAME}/)" >> README.md
-            echo "- **Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> README.md
-            echo "- **Size**: ${{ steps.model_info.outputs.model_size }}" >> README.md
-            echo "- **Parts**: $PART_COUNT" >> README.md
-            echo "" >> README.md
-          fi
+          echo "### ${{ github.event.inputs.model_name }}" >> README.md
+          echo "- **Archive**: [downloads/${ARCHIVE_NAME}/](downloads/${ARCHIVE_NAME}/)" >> README.md
+          echo "- **Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> README.md
+          echo "- **Parts**: $PART_COUNT" >> README.md
+          echo "" >> README.md
           
           git add downloads/${ARCHIVE_NAME}/INFO.txt README.md
-          
-          # Also add the modelfile if available
-          if [ -f modelfile.txt ] && [ -s modelfile.txt ]; then
-            cp modelfile.txt downloads/${ARCHIVE_NAME}/modelfile.txt
-            git add downloads/${ARCHIVE_NAME}/modelfile.txt
-          fi
-          
           git commit -m "Finalize ${ARCHIVE_NAME} - Ollama model ${{ github.event.inputs.model_name }}"
           git push
       
       - name: Clean up
         if: always()
         run: |
-          # Remove the pulled model to free space
           ollama rm ${{ github.event.inputs.model_name }} || true
           rm -rf model_data
-          rm -f modelfile.txt
       
       - name: Summary
+        if: success()
         run: |
-          PART_COUNT=$(ls downloads/${{ steps.prepare.outputs.archive_name }}/*.zip downloads/${{ steps.prepare.outputs.archive_name }}/*.z* 2>/dev/null | wc -l)
-          
-          echo "## ✅ Ollama Model Successfully Archived" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Model** | ${{ github.event.inputs.model_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Archive Name** | ${{ steps.prepare.outputs.archive_name }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Location** | \`downloads/${{ steps.prepare.outputs.archive_name }}/\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Total Parts** | $PART_COUNT |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Model Size** | ${{ steps.model_info.outputs.model_size }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          
-          echo "### How to Restore" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "# Download all parts" >> $GITHUB_STEP_SUMMARY
-          echo "# Extract to Ollama directory" >> $GITHUB_STEP_SUMMARY
-          echo "unzip -P \"YOUR_PASSWORD\" downloads/${{ steps.prepare.outputs.archive_name }}/*.zip -d ~/.ollama/" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "# Verify the model" >> $GITHUB_STEP_SUMMARY
-          echo "ollama list" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ Workflow Completed" >> $GITHUB_STEP_SUMMARY
+          echo "- Model: ${{ github.event.inputs.model_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Archive: \`downloads/${{ steps.prepare.outputs.archive_name }}/\`" >> $GITHUB_STEP_SUMMARY
