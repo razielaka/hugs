@@ -28,6 +28,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
       
       - name: Install dependencies
         run: |
@@ -67,19 +70,6 @@ jobs:
           rm -f downloaded_repo/.gitattributes 2>/dev/null || true
           rm -f downloaded_repo/.gitignore 2>/dev/null || true
           rm -rf downloaded_repo/.hf 2>/dev/null || true
-          echo "Files downloaded:"
-          find downloaded_repo -type f | head -20
-      
-      - name: Get repository info
-        id: info
-        run: |
-          FILE_COUNT=$(find downloaded_repo -type f | wc -l)
-          TOTAL_SIZE=$(du -sb downloaded_repo | cut -f1)
-          TOTAL_SIZE_MB=$(echo "scale=2; $TOTAL_SIZE / 1024 / 1024" | bc)
-          
-          echo "file_count=$FILE_COUNT" >> $GITHUB_OUTPUT
-          echo "total_size_mb=$TOTAL_SIZE_MB" >> $GITHUB_OUTPUT
-          echo "Total size: ${TOTAL_SIZE_MB} MB, Files: $FILE_COUNT"
       
       - name: Create ZIP archive
         id: zip
@@ -94,85 +84,55 @@ jobs:
             "../${ARCHIVE_NAME}.zip" .
           cd ..
           
-          PART_COUNT=$(ls ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* 2>/dev/null | wc -l)
           echo "archive_name=$ARCHIVE_NAME" >> $GITHUB_OUTPUT
-          echo "part_count=$PART_COUNT" >> $GITHUB_OUTPUT
       
-      - name: Create README
+      - name: Create downloads directory
         run: |
           ARCHIVE_NAME="${{ steps.zip.outputs.archive_name }}"
-          REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
-          
-          echo "# ${REPO_NAME} - HuggingFace Repository Archive" > README_${ARCHIVE_NAME}.md
-          echo "" >> README_${ARCHIVE_NAME}.md
-          echo "## Download Information" >> README_${ARCHIVE_NAME}.md
-          echo "- Original Repository: ${{ github.event.inputs.repo_id }}" >> README_${ARCHIVE_NAME}.md
-          echo "- Archive Name: \`${ARCHIVE_NAME}.zip\`" >> README_${ARCHIVE_NAME}.md
-          echo "- Total Size: ${{ steps.info.outputs.total_size_mb }} MB" >> README_${ARCHIVE_NAME}.md
-          echo "- Files: ${{ steps.info.outputs.file_count }}" >> README_${ARCHIVE_NAME}.md
-          echo "- Parts: ${{ steps.zip.outputs.part_count }} parts (${{ github.event.inputs.part_size_mb }}MB each)" >> README_${ARCHIVE_NAME}.md
-          echo "- Password Protected: YES" >> README_${ARCHIVE_NAME}.md
-          echo "" >> README_${ARCHIVE_NAME}.md
-          echo "## Password" >> README_${ARCHIVE_NAME}.md
-          echo "\`\`\`" >> README_${ARCHIVE_NAME}.md
-          echo "${{ github.event.inputs.password }}" >> README_${ARCHIVE_NAME}.md
-          echo "\`\`\`" >> README_${ARCHIVE_NAME}.md
-          echo "" >> README_${ARCHIVE_NAME}.md
-          echo "## How to Extract" >> README_${ARCHIVE_NAME}.md
-          echo "" >> README_${ARCHIVE_NAME}.md
-          echo "1. Download all parts (.zip, .z01, .z02, etc.)" >> README_${ARCHIVE_NAME}.md
-          echo "2. Place them in the same folder" >> README_${ARCHIVE_NAME}.md
-          echo "3. Extract with password using 7-Zip or WinRAR" >> README_${ARCHIVE_NAME}.md
-          echo "" >> README_${ARCHIVE_NAME}.md
-          echo "### Linux/Mac Command Line:" >> README_${ARCHIVE_NAME}.md
-          echo "\`\`\`bash" >> README_${ARCHIVE_NAME}.md
-          echo "unzip -P \"${{ github.event.inputs.password }}\" ${ARCHIVE_NAME}.zip" >> README_${ARCHIVE_NAME}.md
-          echo "\`\`\`" >> README_${ARCHIVE_NAME}.md
-          echo "" >> README_${ARCHIVE_NAME}.md
-          echo "---" >> README_${ARCHIVE_NAME}.md
-          echo "*Archived on: $(date '+%Y-%m-%d %H:%M:%S UTC')*" >> README_${ARCHIVE_NAME}.md
+          mkdir -p downloads/${ARCHIVE_NAME}
       
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: "${{ steps.zip.outputs.archive_name }}_parts"
-          path: |
-            ${{ steps.zip.outputs.archive_name }}.zip
-            ${{ steps.zip.outputs.archive_name }}.z*
-            README_${{ steps.zip.outputs.archive_name }}.md
-          compression-level: 0
-          retention-days: 90
-      
-      - name: Create GitHub Release
-        if: github.ref == 'refs/heads/main'
+      - name: Push ZIP parts incrementally
         run: |
           ARCHIVE_NAME="${{ steps.zip.outputs.archive_name }}"
-          REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
           
-          echo "# ${{ github.event.inputs.repo_id }}" > release_notes.md
-          echo "" >> release_notes.md
-          echo "## Download Information" >> release_notes.md
-          echo "- Total Size: ${{ steps.info.outputs.total_size_mb }} MB" >> release_notes.md
-          echo "- Parts: ${{ steps.zip.outputs.part_count }} parts" >> release_notes.md
-          echo "- Password: \`${{ github.event.inputs.password }}\`" >> release_notes.md
-          echo "" >> release_notes.md
-          echo "## Instructions" >> release_notes.md
-          echo "1. Download all ZIP parts from assets below" >> release_notes.md
-          echo "2. Extract with password using any zip tool" >> release_notes.md
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           
-          gh release create "v-${ARCHIVE_NAME}" \
-            --title "📦 ${REPO_NAME}" \
-            --notes-file release_notes.md \
-            ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z* \
-            "README_${ARCHIVE_NAME}.md" || true
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Push each part individually to avoid timeout
+          for file in ${ARCHIVE_NAME}.zip ${ARCHIVE_NAME}.z*; do
+            if [ -f "$file" ]; then
+              mv "$file" downloads/${ARCHIVE_NAME}/
+              git add downloads/${ARCHIVE_NAME}/$(basename "$file")
+              git commit -m "Add part $(basename "$file") for ${ARCHIVE_NAME}"
+              git push
+              sleep 2
+            fi
+          done
+      
+      - name: Create README and finalize
+        run: |
+          ARCHIVE_NAME="${{ steps.zip.outputs.archive_name }}"
+          
+          cat > downloads/${ARCHIVE_NAME}/INFO.txt << EOF
+          Repository: ${{ github.event.inputs.repo_id }}
+          Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          Parts: $(ls downloads/${ARCHIVE_NAME}/*.zip downloads/${ARCHIVE_NAME}/*.z* 2>/dev/null | wc -l)
+          Password required for extraction
+          EOF
+          
+          if [ ! -f README.md ]; then
+            echo "# Downloaded Repositories" > README.md
+            echo "" >> README.md
+          fi
+          
+          echo "- [${{ github.event.inputs.repo_id }}](downloads/${ARCHIVE_NAME}/)" >> README.md
+          
+          git add downloads/${ARCHIVE_NAME}/INFO.txt README.md
+          git commit -m "Finalize ${ARCHIVE_NAME}"
+          git push
       
       - name: Summary
         run: |
           echo "## ✅ Download Complete" >> $GITHUB_STEP_SUMMARY
           echo "- Repository: ${{ github.event.inputs.repo_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Size: ${{ steps.info.outputs.total_size_mb }} MB" >> $GITHUB_STEP_SUMMARY
-          echo "- Files: ${{ steps.info.outputs.file_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Parts: ${{ steps.zip.outputs.part_count }}" >> $GITHUB_STEP_SUMMARY
-          echo "- Password: \`${{ github.event.inputs.password }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Location: \`downloads/${{ steps.zip.outputs.archive_name }}/\`" >> $GITHUB_STEP_SUMMARY
