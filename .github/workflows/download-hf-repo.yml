@@ -84,6 +84,7 @@ jobs:
           echo "Number of files: $FILE_COUNT"
       
       - name: Create password-protected ZIP with parts
+        id: create-zip
         run: |
           REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
           PASSWORD="${{ github.event.inputs.password }}"
@@ -116,126 +117,112 @@ jobs:
       - name: Generate README with instructions
         run: |
           ARCHIVE_NAME="${{ steps.create-zip.outputs.archive_name }}"
-          if [ -z "$ARCHIVE_NAME" ]; then
-            REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            ARCHIVE_NAME="${REPO_NAME}_${TIMESTAMP}"
-          fi
-          
+          REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
           PASSWORD="${{ github.event.inputs.password }}"
           PART_SIZE="${{ github.event.inputs.part_size_mb }}"
           TOTAL_SIZE_MB="${{ steps.size.outputs.total_size_mb }}"
           FILE_COUNT="${{ steps.size.outputs.file_count }}"
           PART_COUNT="${{ steps.create-zip.outputs.part_count }}"
           
-          cat > "README_${ARCHIVE_NAME}.md" << 'EOF'
-    			# ${REPO_NAME} - HuggingFace Repository Archive
-    
-    			## Download Information
-    			- **Original Repository**: ${{ github.event.inputs.repo_id }}
-    			- **Archive Name**: `${ARCHIVE_NAME}.zip`
-    			- **Total Size**: ${TOTAL_SIZE_MB} MB
-    			- **Files**: ${FILE_COUNT} files
-    			- **Parts**: ${PART_COUNT} parts (${PART_SIZE}MB each)
-    			- **Password Protected**: **YES**
-    
-    			## Password
-    			```
-    			${PASSWORD}
-    			```
-    
-    			## How to Extract
-    
-    			### Windows (7-Zip/WinRAR):
-    			1. Download **all** parts (`.zip`, `.z01`, `.z02`, etc.)
-    			2. Put them in the **same folder**
-    			3. Right-click on `${ARCHIVE_NAME}.zip`
-    			4. Select "Extract Here" or "Extract to folder"
-    			5. Enter password: `${PASSWORD}`
-    
-    			### Linux/Mac:
-    			```bash
-    			# Download all parts to same directory, then:
-    			zip -P "${PASSWORD}" ${ARCHIVE_NAME}.zip -d extracted_files/
-    
-    			# Or using 7zip:
-    			7z x ${ARCHIVE_NAME}.zip -p"${PASSWORD}"
-    			```
-    
-    			### Python:
-    			```python
-    			import zipfile
-    			with zipfile.ZipFile('${ARCHIVE_NAME}.zip', 'r') as zip_ref:
-    				zip_ref.extractall('.', pwd=b'${PASSWORD}')
-    			```
-    
-    			## File List
-    			$(cd downloaded_repo && find . -type f | head -50 | sed 's/^/- /')
-    
-    			---
-    			*Archived on: $(date '+%Y-%m-%d %H:%M:%S UTC')*
-    			*Original source: https://huggingface.co/${{ github.event.inputs.repo_id }}*
-    			EOF
+          cat > "README_${ARCHIVE_NAME}.md" << EOF
+			# ${REPO_NAME} - HuggingFace Repository Archive
+			
+			## Download Information
+			- **Original Repository**: ${{ github.event.inputs.repo_id }}
+			- **Archive Name**: \`${ARCHIVE_NAME}.zip\`
+			- **Total Size**: ${TOTAL_SIZE_MB} MB
+			- **Files**: ${FILE_COUNT} files
+			- **Parts**: ${PART_COUNT} parts (${PART_SIZE}MB each)
+			- **Password Protected**: **YES**
+			
+			## Password
+			\`\`\`
+			${PASSWORD}
+			\`\`\`
+			
+			## How to Extract
+			
+			### Windows (7-Zip/WinRAR):
+			1. Download **all** parts (\`.zip\`, \`.z01\`, \`.z02\`, etc.)
+			2. Put them in the **same folder**
+			3. Right-click on \`${ARCHIVE_NAME}.zip\`
+			4. Select "Extract Here" or "Extract to folder"
+			5. Enter password: \`${PASSWORD}\`
+			
+			### Linux/Mac:
+			\`\`\`bash
+			# Download all parts to same directory, then:
+			zip -P "${PASSWORD}" ${ARCHIVE_NAME}.zip -d extracted_files/
+			
+			# Or using 7zip:
+			7z x ${ARCHIVE_NAME}.zip -p"${PASSWORD}"
+			\`\`\`
+			
+			### Python:
+			\`\`\`python
+			import zipfile
+			with zipfile.ZipFile('${ARCHIVE_NAME}.zip', 'r') as zip_ref:
+			    zip_ref.extractall('.', pwd=b'${PASSWORD}')
+			\`\`\`
+			
+			## File List
+			EOF
           
-          # Substitute variables
-          sed -i "s/\${REPO_NAME}/$(basename "${{ github.event.inputs.repo_id }}")/g" "README_${ARCHIVE_NAME}.md"
-          sed -i "s/\${ARCHIVE_NAME}/${ARCHIVE_NAME}/g" "README_${ARCHIVE_NAME}.md"
-          sed -i "s/\${TOTAL_SIZE_MB}/${TOTAL_SIZE_MB}/g" "README_${ARCHIVE_NAME}.md"
-          sed -i "s/\${FILE_COUNT}/${FILE_COUNT}/g" "README_${ARCHIVE_NAME}.md"
-          sed -i "s/\${PART_COUNT}/${PART_COUNT}/g" "README_${ARCHIVE_NAME}.md"
-          sed -i "s/\${PART_SIZE}/${PART_SIZE}/g" "README_${ARCHIVE_NAME}.md"
-          sed -i "s/\${PASSWORD}/${PASSWORD}/g" "README_${ARCHIVE_NAME}.md"
+          # Add file list
+          cd downloaded_repo && find . -type f | head -50 | sed 's/^/- /' >> "../README_${ARCHIVE_NAME}.md" && cd ..
           
-          echo "README_${ARCHIVE_NAME}.md created"
-      
-      - name: Upload ZIP parts as artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: "${{ steps.create-zip.outputs.archive_name }}_parts"
-          path: |
-            ${{ steps.create-zip.outputs.archive_name }}.zip
-            ${{ steps.create-zip.outputs.archive_name }}.z*
-            README_${{ steps.create-zip.outputs.archive_name }}.md
-          compression-level: 0
-          retention-days: 90
-      
-      - name: Create GitHub Release (Optional)
-        if: github.ref == 'refs/heads/main'
-        run: |
-          ARCHIVE_NAME="${{ steps.create-zip.outputs.archive_name }}"
-          if [ -z "$ARCHIVE_NAME" ]; then
-            REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            ARCHIVE_NAME="${REPO_NAME}_${TIMESTAMP}"
-          fi
-          
-          PASSWORD="${{ github.event.inputs.password }}"
-          TOTAL_SIZE_MB="${{ steps.size.outputs.total_size_mb }}"
-          PART_COUNT="${{ steps.create-zip.outputs.part_count }}"
-          
-          # Create release notes
-          cat > release_notes.md << EOF
-			## 📦 Repository Archive
+          cat >> "README_${ARCHIVE_NAME}.md" << EOF
 
+			---
+			*Archived on: $(date '+%Y-%m-%d %H:%M:%S UTC')*
+			*Original source: https://huggingface.co/${{ github.event.inputs.repo_id }}*
+			EOF
+					  
+					  echo "README_${ARCHIVE_NAME}.md created"
+				  
+				  - name: Upload ZIP parts as artifacts
+					uses: actions/upload-artifact@v4
+					with:
+					  name: "${{ steps.create-zip.outputs.archive_name }}_parts"
+					  path: |
+						${{ steps.create-zip.outputs.archive_name }}.zip
+						${{ steps.create-zip.outputs.archive_name }}.z*
+						README_${{ steps.create-zip.outputs.archive_name }}.md
+					  compression-level: 0
+					  retention-days: 90
+				  
+				  - name: Create GitHub Release (Optional)
+					if: github.ref == 'refs/heads/main'
+					run: |
+					  ARCHIVE_NAME="${{ steps.create-zip.outputs.archive_name }}"
+					  REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
+					  PASSWORD="${{ github.event.inputs.password }}"
+					  TOTAL_SIZE_MB="${{ steps.size.outputs.total_size_mb }}"
+					  PART_COUNT="${{ steps.create-zip.outputs.part_count }}"
+					  
+					  # Create release notes
+					  cat > release_notes.md << EOF
+			## 📦 Repository Archive
+			
 			- **Repository**: ${{ github.event.inputs.repo_id }}
 			- **Total Size**: ${TOTAL_SIZE_MB} MB
 			- **Parts**: ${PART_COUNT} parts (45MB each)
 			- **Password Protected**: YES
-
+			
 			### 🔐 Password
 			\`\`\`
 			${PASSWORD}
 			\`\`\`
-
+			
 			### 📥 Download
 			Download **all** ZIP parts from the Assets section below, then extract using the password above.
-
+			
 			### 🔧 Extraction Instructions
 			1. Download all files: \`${ARCHIVE_NAME}.zip\`, \`${ARCHIVE_NAME}.z01\`, etc.
 			2. Place them in the same folder
 			3. Extract \`${ARCHIVE_NAME}.zip\` with any zip tool (7-Zip, WinRAR, etc.)
 			4. Enter the password when prompted
-
+			
 			---
 			*Generated by GitHub Actions on $(date '+%Y-%m-%d %H:%M:%S UTC')*
 			EOF
@@ -252,12 +239,7 @@ jobs:
       - name: Summary
         run: |
           ARCHIVE_NAME="${{ steps.create-zip.outputs.archive_name }}"
-          if [ -z "$ARCHIVE_NAME" ]; then
-            REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
-            TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-            ARCHIVE_NAME="${REPO_NAME}_${TIMESTAMP}"
-          fi
-          
+          REPO_NAME=$(basename "${{ github.event.inputs.repo_id }}")
           PART_COUNT="${{ steps.create-zip.outputs.part_count }}"
           TOTAL_SIZE_MB="${{ steps.size.outputs.total_size_mb }}"
           FILE_COUNT="${{ steps.size.outputs.file_count }}"
